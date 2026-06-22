@@ -1,4 +1,4 @@
-import { Client } from '../../node_modules/@types/pg';
+import { Client } from 'pg';
 import dotenv from 'dotenv';
 
 dotenv.config();

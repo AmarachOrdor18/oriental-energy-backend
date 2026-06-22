@@ -28,7 +28,22 @@ import { startNotificationJobs } from './services/notificationService';
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors());
+const allowedOrigins = [
+  'https://oriental-energy-frontend.onrender.com',
+  'http://localhost:5173',
+  'http://localhost:4173',
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 app.use('/api/v1/auth', authRoutes);

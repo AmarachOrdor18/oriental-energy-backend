@@ -28,10 +28,15 @@ import { startNotificationJobs } from './services/notificationService';
 const app = express();
 const port = process.env.PORT || 3000;
 
+const LOCAL_ORIGINS = ['http://localhost:5173', 'http://localhost:4173'];
+
+// Comma-separated list, set per environment. Localhost is always allowed for dev.
 const allowedOrigins = [
-  'https://oriental-energy-frontend.onrender.com',
-  'http://localhost:5173',
-  'http://localhost:4173',
+  ...(process.env.ALLOWED_ORIGINS ?? 'https://oriental-energy-frontend.onrender.com')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
+  ...LOCAL_ORIGINS,
 ];
 
 app.use(cors({

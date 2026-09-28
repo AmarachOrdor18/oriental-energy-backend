@@ -18,10 +18,29 @@ router.get('/not-posted', authenticate, requirePage('reports'), async (req, res)
     const params: any[] = [period.start_date, period.end_date];
     let pc = 2;
 
-    if (user.role === 'line_manager') { pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(user.id); }
-    else if (user.role === 'hod') { pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(user.department_id); }
-    if (department_id) { pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(department_id); }
-    if (manager_id) { pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(manager_id); }
+    // Role scoping mirrors Finance/Budgets: HODs are limited to departments they
+    // head plus their own; line managers to their direct reports. Client filters
+    // may only narrow that scope, never widen it.
+    let hodDeptIds: string[] | null = null;
+    if (user.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [user.id]
+      );
+      hodDeptIds = hodDepts.rows.map((r: any) => r.id).filter(Boolean);
+      if (hodDeptIds.length === 0) return res.json({ period, not_posted: [] });
+      pc++; scopeFilter += ` AND u.department_id = ANY($${pc}::text[])`; params.push(hodDeptIds);
+    } else if (user.role === 'line_manager') {
+      pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(user.id);
+    }
+    if (department_id && hodDeptIds === null && user.role !== 'line_manager') {
+      pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(department_id);
+    }
+    if (manager_id && user.role !== 'line_manager' && hodDeptIds === null) {
+      pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(manager_id);
+    }
 
     const result = await pool.query(`
       SELECT u.id, u.name, u.email,
@@ -57,10 +76,33 @@ router.get('/hours-summary', authenticate, requirePage('reports'), async (req, r
     const params: any[] = [date_from, date_to];
     let pc = 2;
 
-    if (user.role === 'line_manager') { pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(user.id); }
-    else if (user.role === 'hod') { pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(user.department_id); }
-    if (user_id) { pc++; scopeFilter += ` AND dl.user_id=$${pc}`; params.push(user_id); }
-    if (department_id) { pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(department_id); }
+    // Same role scoping as not-posted: HOD = departments they head (+ own),
+    // line manager = direct reports; client filters only narrow.
+    let hodDeptIds: string[] | null = null;
+    if (user.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [user.id]
+      );
+      hodDeptIds = hodDepts.rows.map((r: any) => r.id).filter(Boolean);
+      if (hodDeptIds.length === 0) return res.json({ rows: [], summary: { total_hours: 0, date_from, date_to } });
+      pc++; scopeFilter += ` AND u.department_id = ANY($${pc}::text[])`; params.push(hodDeptIds);
+    } else if (user.role === 'line_manager') {
+      pc++; scopeFilter += ` AND u.manager_id=$${pc}`; params.push(user.id);
+    }
+    if (user_id && user.role === 'line_manager') {
+      // Only allow pinning a user who is actually a direct report.
+      const rep = await pool.query('SELECT 1 FROM users WHERE id=$1 AND manager_id=$2', [user_id, user.id]);
+      if (rep.rows.length === 0) return res.status(403).json({ error: 'You can only report on your direct reports.' });
+      pc++; scopeFilter += ` AND dl.user_id=$${pc}`; params.push(user_id);
+    } else if (user_id && user.role !== 'line_manager') {
+      pc++; scopeFilter += ` AND dl.user_id=$${pc}`; params.push(user_id);
+    }
+    if (department_id && hodDeptIds === null && user.role !== 'line_manager') {
+      pc++; scopeFilter += ` AND u.department_id=$${pc}`; params.push(department_id);
+    }
     if (project_id) { pc++; scopeFilter += ` AND dl.project_id=$${pc}`; params.push(project_id); }
 
     const result = await pool.query(`

@@ -21,6 +21,39 @@ router.get('/', authenticate, requirePage('utilisation'), async (req, res) => {
 
   try {
     const standardDay = 8;
+    const user = req.user!;
+
+    // Role scoping mirrors Finance/Budgets: a HOD sees only their department(s)
+    // (departments they head, plus their own), a line manager only their direct
+    // reports, finance/admin see everything. A client-supplied department_id can
+    // only ever narrow the viewer's own scope — never widen it.
+    let scopeSql = '';
+    const scopeParams: any[] = [];
+    if (user.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [user.id]
+      );
+      const ids = hodDepts.rows.map((r: any) => r.id).filter(Boolean);
+      if (ids.length === 0) {
+        return res.json({ year, month, standard_day_hours: standardDay, rows: [], departments: [] });
+      }
+      scopeSql = `AND u.department_id = ANY($4::text[])`;
+      scopeParams.push(ids);
+    } else if (user.role === 'line_manager') {
+      scopeSql = `AND u.manager_id = $5`;
+      scopeParams.push(user.id);
+    }
+
+    // Requested department filter (finance/admin only — it may narrow, never widen)
+    let filterSql = '';
+    if (department_id && user.role !== 'hod' && user.role !== 'line_manager') {
+      filterSql = `AND u.department_id = $6`;
+      scopeParams.push(String(department_id));
+    }
+
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = new Date(year, month, 0).toISOString().slice(0, 10); // last day of month
 
@@ -55,10 +88,10 @@ router.get('/', authenticate, requirePage('utilisation'), async (req, res) => {
       FROM users u
       LEFT JOIN departments d ON u.department_id = d.id
       WHERE u.is_active = true AND u.role IN ('user','line_manager','hod')
-        ${department_id ? 'AND u.department_id = $4' : ''}
+        ${scopeSql}
+        ${filterSql}
     `;
-    const capParams: any[] = [monthStart, monthEnd, standardDay];
-    if (department_id) capParams.push(department_id);
+    const capParams: any[] = [monthStart, monthEnd, standardDay, ...scopeParams];
     const capacityRes = await pool.query(capacitySql, capParams);
 
     // Logged hours per user in the month (real work only — leave days carry no hours)

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { pool } from '../db';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requirePage } from '../middleware/auth';
 
 const router = Router();
 
@@ -9,7 +9,7 @@ const router = Router();
 // public holidays and approved leave days (both already known to the system).
 // Logged = daily_logs in the month. Utilisation % = logged / capacity.
 // Query: year, month, department_id (optional).
-router.get('/', authenticate, requireRole('finance', 'admin', 'hod', 'line_manager'), async (req, res) => {
+router.get('/', authenticate, requirePage('utilisation'), async (req, res) => {
   const now = new Date();
   const year = parseInt(String(req.query.year || now.getFullYear()), 10);
   const month = parseInt(String(req.query.month || now.getMonth() + 1), 10); // 1-12

@@ -55,6 +55,29 @@ export function authenticate(req: Request, res: Response, next: NextFunction) {
 }
 
 /**
+ * Page-permission middleware factory. Mirrors the frontend route guard: a page
+ * is reachable if the user's effective permissions include it. Admin always
+ * passes. Pages without an entry in the catalog stay open to everyone (the
+ * catalog only gates the reporting/admin surfaces).
+ * Usage: router.get('/', authenticate, requirePage('finance'), ...)
+ */
+export function requirePage(page: string) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
+    if (req.user.role === 'admin') return next();
+    try {
+      const { effectivePermissions } = await import('../services/permissionsService');
+      const pages = await effectivePermissions(req.user.id, req.user.role);
+      if (pages.includes(page)) return next();
+      return res.status(403).json({ error: 'You do not have access to this page. Ask an administrator to grant it.' });
+    } catch (err) {
+      console.error('Permission check error:', err);
+      return res.status(500).json({ error: 'Failed to verify permissions.' });
+    }
+  };
+}
+
+/**
  * Role-checking middleware factory.
  * Usage: requireRole('admin', 'line_manager')
  */

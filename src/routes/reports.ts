@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { pool } from '../db';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requirePage } from '../middleware/auth';
 
 const router = Router();
 
 // GET /reports/not-posted?period_code=&department_id=&manager_id=
-router.get('/not-posted', authenticate, requireRole('finance', 'admin', 'hod', 'line_manager'), async (req, res) => {
+router.get('/not-posted', authenticate, requirePage('reports'), async (req, res) => {
   const { period_code, department_id, manager_id } = req.query;
   if (!period_code) return res.status(400).json({ error: 'period_code is required.' });
   const user = req.user!;
@@ -48,7 +48,7 @@ router.get('/not-posted', authenticate, requireRole('finance', 'admin', 'hod', '
 });
 
 // GET /reports/hours-summary?date_from=&date_to=&user_id=&department_id=&project_id=
-router.get('/hours-summary', authenticate, requireRole('finance', 'admin', 'hod', 'line_manager'), async (req, res) => {
+router.get('/hours-summary', authenticate, requirePage('reports'), async (req, res) => {
   const { date_from, date_to, user_id, department_id, project_id } = req.query;
   if (!date_from || !date_to) return res.status(400).json({ error: 'date_from and date_to are required.' });
   const user = req.user!;

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { pool } from '../db';
+import { effectivePermissions } from '../services/permissionsService';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { authenticate, tokenBlacklist } from '../middleware/auth';
@@ -58,7 +59,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// GET /auth/me — Return current user profile from token
+// GET /auth/me — Return current user profile from token, with effective page permissions
 router.get('/me', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -76,7 +77,9 @@ router.get('/me', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'User not found.' });
     }
 
-    res.json(result.rows[0]);
+    const user = result.rows[0];
+    const pages = await effectivePermissions(user.id, user.role);
+    res.json({ ...user, pages });
   } catch (err) {
     console.error('Auth/me error:', err);
     res.status(500).json({ error: 'Failed to fetch user profile.' });

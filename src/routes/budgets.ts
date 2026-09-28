@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import { pool } from '../db';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requirePage } from '../middleware/auth';
 import { logAudit } from '../utils/audit';
 
 const router = Router();
 
 // GET /budgets?year=&department_id= — all projects with budget vs actual for the year
-router.get('/', authenticate, requireRole('finance', 'admin', 'hod'), async (req, res) => {
+router.get('/', authenticate, requirePage('budgets'), async (req, res) => {
   const year = parseInt(String(req.query.year || new Date().getFullYear()), 10);
   const { department_id } = req.query;
   try {

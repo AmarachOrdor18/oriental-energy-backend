@@ -27,6 +27,7 @@ import activityRoutes from './routes/activities';
 import utilisationRoutes from './routes/utilisation';
 import rateCardRoutes from './routes/rateCards';
 import budgetRoutes from './routes/budgets';
+import permissionRoutes from './routes/permissions';
 import { startNotificationJobs } from './services/notificationService';
 import { sendDueBroadcasts } from './services/broadcastService';
 
@@ -80,6 +81,7 @@ app.use('/api/v1/activities', activityRoutes);
 app.use('/api/v1/utilisation', utilisationRoutes);
 app.use('/api/v1/rate-cards', rateCardRoutes);
 app.use('/api/v1/budgets', budgetRoutes);
+app.use('/api/v1/permissions', permissionRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', version: 'v5.0', timestamp: new Date().toISOString() });

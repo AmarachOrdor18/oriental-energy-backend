@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { notify } from '../services/emailService';
 import { pool } from '../db';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requirePage } from '../middleware/auth';
 import { logAudit } from '../utils/audit';
 import { dispatchBroadcast } from '../services/broadcastService';
 
@@ -18,7 +18,7 @@ async function canReviewTimesheet(requestUser: NonNullable<Express.Request['user
   return result.rows.length > 0;
 }
 
-router.get('/pending', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.get('/pending', authenticate, requirePage('approvals'), async (req, res) => {
   const user = req.user!;
   try {
     let query = `SELECT t.*, u.name as user_name, u.email as user_email, d.name as department_name
@@ -34,7 +34,7 @@ router.get('/pending', authenticate, requireRole('line_manager', 'hod', 'admin')
   }
 });
 
-router.patch('/:id/approve', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.patch('/:id/approve', authenticate, requirePage('approvals'), async (req, res) => {
   const user = req.user!;
   try {
     if (!(await canReviewTimesheet(user, String(req.params.id)))) return res.status(403).json({ error: 'Access denied.' });
@@ -48,7 +48,7 @@ router.patch('/:id/approve', authenticate, requireRole('line_manager', 'hod', 'a
   }
 });
 
-router.patch('/:id/reject', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.patch('/:id/reject', authenticate, requirePage('approvals'), async (req, res) => {
   const { reason } = req.body;
   if (!reason) return res.status(400).json({ error: 'Rejection reason is required.' });
   const user = req.user!;
@@ -64,7 +64,7 @@ router.patch('/:id/reject', authenticate, requireRole('line_manager', 'hod', 'ad
   }
 });
 
-router.post('/bulk-approve', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.post('/bulk-approve', authenticate, requirePage('approvals'), async (req, res) => {
   const { ids } = req.body;
   if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: 'ids array required.' });
   const user = req.user!;
@@ -91,7 +91,7 @@ router.post('/bulk-approve', authenticate, requireRole('line_manager', 'hod', 'a
   }
 });
 
-router.post('/approve-month', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.post('/approve-month', authenticate, requirePage('approvals'), async (req, res) => {
   const { user_id, period_code } = req.body;
   if (!user_id || !period_code) return res.status(400).json({ error: 'user_id and period_code required.' });
   const user = req.user!;
@@ -124,7 +124,7 @@ router.post('/approve-month', authenticate, requireRole('line_manager', 'hod', '
   }
 });
 
-router.post('/broadcast-reminder', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.post('/broadcast-reminder', authenticate, requirePage('approvals'), async (req, res) => {
   const { message, defaulters_only } = req.body || {};
   const user = req.user!;
   try {
@@ -144,7 +144,7 @@ router.post('/broadcast-reminder', authenticate, requireRole('line_manager', 'ho
 
 // ── Scheduled broadcasts ────────────────────────────────────────────────────
 // POST /broadcasts | schedule for later (scheduled_for ISO) or send now when omitted
-router.post('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.post('/broadcasts', authenticate, requirePage('approvals'), async (req, res) => {
   const { message, defaulters_only, scheduled_for } = req.body || {};
   const user = req.user!;
   if (!message || !String(message).trim()) {
@@ -188,7 +188,7 @@ router.post('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'adm
 });
 
 // GET /broadcasts | this sender's history (scheduled + sent), newest first
-router.get('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.get('/broadcasts', authenticate, requirePage('approvals'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, message, defaulters_only, scheduled_for, sent_at, status, recipient_count, created_at
@@ -203,7 +203,7 @@ router.get('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'admi
 });
 
 // DELETE /broadcasts/:id | cancel a pending scheduled broadcast (owner only)
-router.delete('/broadcasts/:id', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+router.delete('/broadcasts/:id', authenticate, requirePage('approvals'), async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE scheduled_broadcasts SET status='cancelled'

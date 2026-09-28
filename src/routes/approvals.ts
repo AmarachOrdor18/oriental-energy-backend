@@ -26,7 +26,7 @@ router.get('/pending', authenticate, requirePage('approvals'), async (req, res) 
                  WHERE t.status IN ('submitted','under_review')`;
     const params: any[] = [];
     if (user.role === 'line_manager') { query += ` AND t.user_id IN (SELECT id FROM users WHERE manager_id=$1)`; params.push(user.id); }
-    else if (user.role === 'hod') { query += ` AND t.user_id IN (SELECT id FROM users WHERE department_id=$1)`; params.push(user.department_id); }
+    else if (user.role === 'hod') { query += ` AND t.user_id IN (SELECT id FROM users WHERE department_id=$1) AND t.user_id <> $2`; params.push(user.department_id, user.id); }
     query += ' ORDER BY t.submitted_at ASC';
     res.json((await pool.query(query, params)).rows);
   } catch (err) {

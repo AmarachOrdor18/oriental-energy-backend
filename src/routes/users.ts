@@ -62,6 +62,46 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
+// GET /users/team-overview — The Team Members page feed, scoped exactly like
+// the Review Queue so the two pages always agree: a line manager sees their
+// direct reports, a HOD their whole department, admin everyone. Each row
+// carries the person's most recent timesheet status.
+// NOTE: must be declared BEFORE router.get('/:id') — otherwise Express matches
+// "team-overview" as an :id and the endpoint 404s.
+router.get('/team-overview', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+  const user = req.user!;
+  try {
+    let scopeSql = '';
+    const params: any[] = [];
+    if (user.role === 'line_manager') {
+      scopeSql = 'WHERE u.manager_id = $1 AND u.is_active = true';
+      params.push(user.id);
+    } else if (user.role === 'hod') {
+      scopeSql = 'WHERE u.department_id = $1 AND u.id <> $2 AND u.is_active = true';
+      params.push(user.department_id, user.id);
+    }
+
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.name, u.role, u.department_id, d.name AS department_name,
+              (SELECT json_build_object(
+                'id', t.id, 'status', t.status, 'week_start_date', t.week_start_date,
+                'week_end_date', t.week_end_date, 'submitted_at', t.submitted_at)
+               FROM timesheets t
+               WHERE t.user_id = u.id
+               ORDER BY t.week_start_date DESC LIMIT 1) AS recent_ts
+       FROM users u
+       LEFT JOIN departments d ON u.department_id = d.id
+       ${scopeSql}
+       ORDER BY u.name ASC`,
+      params
+    );
+    res.json(result.rows.map((r: any) => ({ ...r, recentTs: r.recent_ts || null, recent_ts: undefined })));
+  } catch (err) {
+    console.error('Team overview error:', err);
+    res.status(500).json({ error: 'Failed to fetch team overview.' });
+  }
+});
+
 // GET /users/:id — Get single user profile
 router.get('/:id', authenticate, async (req, res) => {
   try {

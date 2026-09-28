@@ -1,7 +1,9 @@
 import { Router } from 'express';
+import { notify } from '../services/emailService';
 import { pool } from '../db';
 import { authenticate, requireRole } from '../middleware/auth';
 import { logAudit } from '../utils/audit';
+import { dispatchBroadcast } from '../services/broadcastService';
 
 const router = Router();
 
@@ -38,8 +40,8 @@ router.patch('/:id/approve', authenticate, requireRole('line_manager', 'hod', 'a
     if (!(await canReviewTimesheet(user, String(req.params.id)))) return res.status(403).json({ error: 'Access denied.' });
     const result = await pool.query(`UPDATE timesheets SET status='approved', approved_by=$1, approved_at=NOW() WHERE id=$2 RETURNING *`, [user.id, req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Not found.' });
-    await pool.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'approval','Timesheet approved',$2)`,
-      [result.rows[0].user_id, `Your timesheet has been approved by ${user.name}.`]);
+    await notify(result.rows[0].user_id, 'approval', 'Timesheet approved',
+      `Your timesheet has been approved by ${user.name}.`);
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to approve.' });
@@ -54,8 +56,8 @@ router.patch('/:id/reject', authenticate, requireRole('line_manager', 'hod', 'ad
     if (!(await canReviewTimesheet(user, String(req.params.id)))) return res.status(403).json({ error: 'Access denied.' });
     const result = await pool.query(`UPDATE timesheets SET status='rejected', approved_by=$1, approved_at=NOW(), rejection_reason=$2 WHERE id=$3 RETURNING *`, [user.id, reason, req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Not found.' });
-    await pool.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'approval','Timesheet returned',$2)`,
-      [result.rows[0].user_id, `Your timesheet was returned by ${user.name}. Reason: ${reason}`]);
+    await notify(result.rows[0].user_id, 'approval', 'Timesheet returned',
+      `Your timesheet was returned by ${user.name}. Reason: ${reason}`);
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to reject.' });
@@ -79,8 +81,8 @@ router.post('/bulk-approve', authenticate, requireRole('line_manager', 'hod', 'a
       [user.id, allowedIds]
     );
     for (const ts of result.rows) {
-      await pool.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'approval','Timesheet approved',$2)`,
-        [ts.user_id, `Your timesheet approved by ${user.name} (bulk).`]);
+      await notify(ts.user_id, 'approval', 'Timesheet approved',
+        `Your timesheet approved by ${user.name} (bulk).`);
     }
     await logAudit(user.id, user.name, 'bulk_approval', 'timesheet', null, `Bulk approved ${result.rows.length} timesheets`);
     res.json({ approved: result.rows.length, ids: result.rows.map((r: any) => r.id) });
@@ -113,9 +115,8 @@ router.post('/approve-month', authenticate, requireRole('line_manager', 'hod', '
       await logAudit(user.id, user.name, 'timesheet_approved', 'timesheet', ts.id, `Month approval: ${period_code}`);
     }
     if (result.rows.length > 0) {
-      await pool.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'approval',$2,$3)`,
-        [user_id, `All timesheets approved for ${period_code}`,
-          `${user.name} approved all ${result.rows.length} timesheet(s) for period ${period_code}.`]);
+      await notify(user_id, 'approval', `All timesheets approved for ${period_code}`,
+        `${user.name} approved all ${result.rows.length} timesheet(s) for period ${period_code}.`);
     }
     res.json({ approved: result.rows.length, period_code, ids: result.rows.map((r: any) => r.id) });
   } catch (err) {
@@ -123,42 +124,98 @@ router.post('/approve-month', authenticate, requireRole('line_manager', 'hod', '
   }
 });
 
-router.post('/broadcast-reminder', authenticate, requireRole('line_manager', 'hod'), async (req, res) => {
+router.post('/broadcast-reminder', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
   const { message, defaulters_only } = req.body || {};
   const user = req.user!;
   try {
-    const scope = user.role === 'line_manager' ? user.id : user.department_id;
-    const col = user.role === 'line_manager' ? 'manager_id' : 'department_id';
-    let memberIds: string[];
-    if (defaulters_only) {
-      const weekStart = new Date();
-      const day = weekStart.getDay();
-      weekStart.setDate(weekStart.getDate() - (day === 0 ? 6 : day - 1));
-      const weekStartStr = weekStart.toISOString().split('T')[0];
-      const result = await pool.query(
-        `SELECT u.id FROM users u
-         WHERE u.${col} = $1 AND u.is_active = true
-           AND u.id NOT IN (
-             SELECT user_id FROM timesheets
-             WHERE week_start_date = $2
-               AND status IN ('submitted', 'under_review', 'approved')
-           )`,
-        [scope, weekStartStr]
-      );
-      memberIds = result.rows.map((r: any) => r.id);
-    } else {
-      const result = await pool.query(`SELECT id FROM users WHERE ${col}=$1 AND is_active=true`, [scope]);
-      memberIds = result.rows.map((r: any) => r.id);
-    }
-    for (const id of memberIds) {
-      await pool.query(
-        `INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'broadcast',$2,$3)`,
-        [id, `Reminder from ${user.name}`, message || 'Please submit your timesheets.']
-      );
-    }
-    res.json({ sent: memberIds.length, message: `Reminder sent to ${memberIds.length} member${memberIds.length !== 1 ? 's' : ''}.` });
+    const count = await dispatchBroadcast({
+      senderId: user.id,
+      senderName: user.name,
+      role: user.role,
+      departmentId: user.department_id,
+      message: message || 'Please submit your timesheets.',
+      defaultersOnly: !!defaulters_only,
+    });
+    res.json({ sent: count, message: `Reminder sent to ${count} member${count !== 1 ? 's' : ''}.` });
   } catch (err) {
     res.status(500).json({ error: 'Failed to send broadcast.' });
+  }
+});
+
+// ── Scheduled broadcasts ────────────────────────────────────────────────────
+// POST /broadcasts | schedule for later (scheduled_for ISO) or send now when omitted
+router.post('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+  const { message, defaulters_only, scheduled_for } = req.body || {};
+  const user = req.user!;
+  if (!message || !String(message).trim()) {
+    return res.status(400).json({ error: 'message is required.' });
+  }
+  let scheduledFor: Date | null = null;
+  if (scheduled_for) {
+    scheduledFor = new Date(scheduled_for);
+    if (Number.isNaN(scheduledFor.getTime())) {
+      return res.status(400).json({ error: 'scheduled_for must be a valid datetime.' });
+    }
+  }
+  try {
+    if (!scheduledFor) {
+      // Immediate send via the shared dispatcher.
+      const count = await dispatchBroadcast({
+        senderId: user.id,
+        senderName: user.name,
+        role: user.role,
+        departmentId: user.department_id,
+        message,
+        defaultersOnly: !!defaulters_only,
+      });
+      const record = await pool.query(
+        `INSERT INTO scheduled_broadcasts (sender_id, message, defaulters_only, sent_at, status, recipient_count)
+         VALUES ($1,$2,$3,NOW(),'sent',$4) RETURNING id`,
+        [user.id, message, !!defaulters_only, count]
+      );
+      return res.json({ id: record.rows[0].id, sent: count, status: 'sent' });
+    }
+    const record = await pool.query(
+      `INSERT INTO scheduled_broadcasts (sender_id, message, defaulters_only, scheduled_for)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [user.id, message, !!defaulters_only, scheduledFor]
+    );
+    res.json({ id: record.rows[0].id, status: 'scheduled', scheduled_for: record.rows[0].scheduled_for });
+  } catch (err) {
+    console.error('Broadcast create error:', err);
+    res.status(500).json({ error: 'Failed to create broadcast.' });
+  }
+});
+
+// GET /broadcasts | this sender's history (scheduled + sent), newest first
+router.get('/broadcasts', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, message, defaulters_only, scheduled_for, sent_at, status, recipient_count, created_at
+       FROM scheduled_broadcasts WHERE sender_id = $1
+       ORDER BY COALESCE(scheduled_for, sent_at, created_at) DESC LIMIT 50`,
+      [req.user!.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load broadcasts.' });
+  }
+});
+
+// DELETE /broadcasts/:id | cancel a pending scheduled broadcast (owner only)
+router.delete('/broadcasts/:id', authenticate, requireRole('line_manager', 'hod', 'admin'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE scheduled_broadcasts SET status='cancelled'
+       WHERE id=$1 AND sender_id=$2 AND status='scheduled' RETURNING id`,
+      [req.params.id, req.user!.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No pending scheduled broadcast with that id.' });
+    }
+    res.json({ cancelled: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to cancel broadcast.' });
   }
 });
 

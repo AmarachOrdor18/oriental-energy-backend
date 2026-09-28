@@ -147,10 +147,23 @@ router.get('/monthly-summary/view', authenticate, async (req, res) => {
 // GET /timesheets/:id
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const ts = await pool.query(`SELECT t.*, u.name as user_name, u.department_id FROM timesheets t JOIN users u ON t.user_id=u.id WHERE t.id=$1`, [req.params.id]);
+    const ts = await pool.query(`SELECT t.*, u.name as user_name, d.name as department_name FROM timesheets t JOIN users u ON t.user_id=u.id LEFT JOIN departments d ON u.department_id=d.id WHERE t.id=$1`, [req.params.id]);
     if (ts.rows.length === 0) return res.status(404).json({ error: 'Not found.' });
     if (!(await canAccessUser(req.user!, ts.rows[0].user_id))) return res.status(403).json({ error: 'Access denied.' });
-    const entries = await pool.query(`SELECT e.*, p.name as project_name, p.code as project_code FROM timesheet_entries e LEFT JOIN projects p ON e.project_id=p.id WHERE e.timesheet_id=$1 ORDER BY e.date ASC`, [req.params.id]);
+    // The platform's real entry data lives in daily_logs (timesheet_entries is
+    // only written by the legacy bulk-entry path). Read the daily logs for this
+    // timesheet's week so the detail panel shows what was actually logged.
+    const entries = await pool.query(`
+      SELECT dl.id, dl.date, dl.hours, dl.notes,
+             CASE WHEN dl.notes IN ('annual_leave','sick_leave') THEN dl.notes ELSE 'work' END AS entry_type,
+             p.name as project_name, p.code as project_code, a.name as activity_name
+      FROM daily_logs dl
+      JOIN timesheets t2 ON t2.id = $1
+      LEFT JOIN projects p ON dl.project_id = p.id
+      LEFT JOIN activities a ON dl.activity_id = a.id
+      WHERE dl.user_id = t2.user_id AND dl.week_start_date = t2.week_start_date
+      ORDER BY dl.date ASC
+    `, [req.params.id]);
     res.json({ ...ts.rows[0], entries: entries.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch timesheet.' });

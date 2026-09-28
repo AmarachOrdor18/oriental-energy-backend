@@ -10,7 +10,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key';
 
 // POST /auth/login — Authenticate with email + password
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  // Autofill, paste and mobile keyboards regularly add stray spaces or
+  // capitalise the address — normalise instead of failing the user.
+  const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : req.body.email;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }

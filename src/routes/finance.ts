@@ -2,16 +2,17 @@ import { Router } from 'express';
 import { pool } from '../db';
 import { authenticate, requireRole } from '../middleware/auth';
 import { logAudit } from '../utils/audit';
+import { notify } from '../services/emailService';
 
 const router = Router();
 
 // GET /finance/review-queue
-router.get('/review-queue', authenticate, requireRole('finance', 'admin'), async (req, res) => {
+router.get('/review-queue', authenticate, requireRole('finance', 'admin', 'hod'), async (req, res) => {
   const { period, project_id, department_id } = req.query;
   try {
     let query = `
       SELECT t.id as timesheet_id, p.id as project_id, p.name as project_name, p.code as project_code,
-             p.afe_code, d.name as department_name, u.id as user_id, u.name as user_name,
+             p.afe_code, d.id as department_id, d.name as department_name, u.id as user_id, u.name as user_name, u.role as user_role,
              SUM(dl.hours) as total_hours,
              COUNT(DISTINCT dl.date) FILTER (WHERE dl.notes IN ('annual_leave','sick_leave')) as leave_days,
              COUNT(DISTINCT dl.date) FILTER (WHERE ph.id IS NOT NULL) as public_holiday_days,
@@ -32,14 +33,65 @@ router.get('/review-queue', authenticate, requireRole('finance', 'admin'), async
     if (project_id) { pc++; query += ` AND p.id=$${pc}`; params.push(project_id); }
     if (department_id) { pc++; query += ` AND p.department_id=$${pc}`; params.push(department_id); }
     query += `
-      GROUP BY t.id, p.id, p.name, p.code, d.name, u.id, u.name
+      GROUP BY t.id, p.id, p.name, p.code, d.id, d.name, u.id, u.name
       HAVING SUM(dl.hours) > 0
         OR COUNT(DISTINCT dl.date) FILTER (WHERE dl.notes IN ('annual_leave','sick_leave')) > 0
       ORDER BY p.name ASC, u.name ASC
     `;
     const result = await pool.query(query, params);
+
+    // HODs are scoped to their own department(s) — where they are the HOD, or
+    // where the timesheet owner belongs to their department. Rows outside the
+    // HOD's department(s) are removed before any money math runs.
+    if (req.user!.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [req.user!.id]
+      );
+      const allowed = new Set(hodDepts.rows.map((r: any) => r.id));
+      result.rows = result.rows.filter((r: any) => allowed.has(r.department_id));
+    }
+
+    // Attach effective-dated cost/charge values per line via fn_rate_for.
+    // Grade = user's current role-based grade proxy (user → 'STAFF', managers/HODs → 'MANAGEMENT')
+    // until a dedicated grade column exists on users. Missing rate ⇒ null values, shown as '—'.
+    const rateCache = new Map<string, { cost: number; charge: number; currency: string } | null>();
+    let totalCost = 0, totalCharge = 0, ratedLines = 0;
+    for (const row of result.rows) {
+      const grade = ['line_manager', 'hod'].includes(String(row.user_role || '')) ? 'MANAGEMENT' : 'STAFF';
+      const key = `${grade}|${row.project_id}|${period || 'ALL'}`;
+      if (!rateCache.has(key)) {
+        const onDate = period ? `${period}-28` : new Date().toISOString().slice(0, 10);
+        const r = await pool.query(
+          `SELECT cost_rate, charge_rate, currency FROM fn_rate_for($1, $2, $3::date)`,
+          [grade, row.project_id, onDate]
+        );
+        rateCache.set(key, r.rows.length ? { cost: parseFloat(r.rows[0].cost_rate), charge: parseFloat(r.rows[0].charge_rate), currency: r.rows[0].currency } : null);
+      }
+      const rate = rateCache.get(key);
+      if (rate) {
+        row.cost_value = Math.round(row.total_hours * rate.cost * 100) / 100;
+        row.charge_value = Math.round(row.total_hours * rate.charge * 100) / 100;
+        row.rate_currency = rate.currency;
+        totalCost += row.cost_value; totalCharge += row.charge_value; ratedLines++;
+      } else {
+        row.cost_value = null; row.charge_value = null; row.rate_currency = null;
+      }
+    }
+
     const totalHours = result.rows.reduce((sum: number, row: any) => sum + parseFloat(row.total_hours || 0), 0);
-    res.json({ rows: result.rows, summary: { total_hours: totalHours } });
+    res.json({
+      rows: result.rows,
+      summary: {
+        total_hours: totalHours,
+        total_cost: Math.round(totalCost * 100) / 100,
+        total_charge: Math.round(totalCharge * 100) / 100,
+        lines_with_rates: ratedLines,
+        lines_total: result.rows.length,
+      },
+    });
   } catch (err) {
     console.error('Finance review error:', err);
     res.status(500).json({ error: 'Failed to generate finance review queue.' });
@@ -47,7 +99,7 @@ router.get('/review-queue', authenticate, requireRole('finance', 'admin'), async
 });
 
 // GET /finance/review-queue/lines?period=&user_id= — individual daily lines for drill-down
-router.get('/review-queue/lines', authenticate, requireRole('finance', 'admin'), async (req, res) => {
+router.get('/review-queue/lines', authenticate, requireRole('finance', 'admin', 'hod'), async (req, res) => {
   const { period, user_id } = req.query;
   if (!period || !user_id) return res.status(400).json({ error: 'period and user_id are required.' });
   try {
@@ -55,11 +107,12 @@ router.get('/review-queue/lines', authenticate, requireRole('finance', 'admin'),
       SELECT
         dl.id          AS log_id,
         dl.date,
-        TO_CHAR(dl.date, 'Month YYYY')   AS month,
+        TO_CHAR(dl.date, 'YYYY-MM')      AS month,
         dl.hours,
         dl.notes                          AS entry_notes,
         u.id           AS user_id,
         u.name         AS user_name,
+        u.role         AS user_role,
         p.id           AS project_id,
         p.name         AS project_name,
         p.code         AS project_code,
@@ -90,6 +143,46 @@ router.get('/review-queue/lines', authenticate, requireRole('finance', 'admin'),
         AND dl.hours > 0
       ORDER BY dl.date ASC, p.name ASC
     `, [user_id, period]);
+
+    // HODs may only drill into their own staff — same scoping rule as the queue.
+    if (req.user!.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [req.user!.id]
+      );
+      const allowed = new Set(hodDepts.rows.map((r: any) => r.id));
+      const target = await pool.query('SELECT department_id FROM users WHERE id = $1', [user_id]);
+      if (!target.rows.length || !allowed.has(target.rows[0].department_id)) {
+        return res.status(403).json({ error: 'You can only view staff in your department.' });
+      }
+    }
+
+    // Attach effective-dated  cost/charge values per line via fn_rate_for,
+    // looked up at each line's own date (same convention as the review queue).
+    const rateCache = new Map<string, { cost: number; charge: number; currency: string } | null>();
+    for (const row of result.rows) {
+      const grade = ['line_manager', 'hod'].includes(String(row.user_role || '')) ? 'MANAGEMENT' : 'STAFF';
+      const onDate = row.date ? new Date(row.date).toISOString().slice(0, 10) : `${period}-28`;
+      const key = `${grade}|${row.project_id}|${onDate}`;
+      if (!rateCache.has(key)) {
+        const r = await pool.query(
+          `SELECT cost_rate, charge_rate, currency FROM fn_rate_for($1, $2, $3::date)`,
+          [grade, row.project_id, onDate]
+        );
+        rateCache.set(key, r.rows.length ? { cost: parseFloat(r.rows[0].cost_rate), charge: parseFloat(r.rows[0].charge_rate), currency: r.rows[0].currency } : null);
+      }
+      const rate = rateCache.get(key);
+      if (rate) {
+        row.cost_value = Math.round(parseFloat(row.hours) * rate.cost * 100) / 100;
+        row.charge_value = Math.round(parseFloat(row.hours) * rate.charge * 100) / 100;
+        row.rate_currency = rate.currency;
+      } else {
+        row.cost_value = null; row.charge_value = null; row.rate_currency = null;
+      }
+    }
+
     res.json(result.rows);
   } catch (err) {
     console.error('Finance lines error:', err);
@@ -123,10 +216,9 @@ router.post('/decisions', authenticate, requireRole('finance', 'admin'), async (
       `, [d.timesheet_id, d.user_id, d.project_id, period, d.decision, d.review_notes || null, user.id]);
       saved.push(r.rows[0]);
       if (d.decision === 'queried' || d.decision === 'rejected') {
-        await client.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1,'system',$2,$3)`,
-          [d.user_id,
-           `Finance ${d.decision === 'queried' ? 'query' : 'rejection'} on your timesheet`,
-           `${user.name} has ${d.decision === 'queried' ? 'queried' : 'rejected'} your timesheet for period ${period}: ${d.review_notes}`]);
+        await notify(d.user_id, 'system',
+          `Finance ${d.decision === 'queried' ? 'query' : 'rejection'} on your timesheet`,
+          `${user.name} has ${d.decision === 'queried' ? 'queried' : 'rejected'} your timesheet for period ${period}: ${d.review_notes}`);
       }
     }
     await client.query('COMMIT');
@@ -143,18 +235,29 @@ router.post('/decisions', authenticate, requireRole('finance', 'admin'), async (
 });
 
 // GET /finance/decisions?period=
-router.get('/decisions', authenticate, requireRole('finance', 'admin'), async (req, res) => {
+router.get('/decisions', authenticate, requireRole('finance', 'admin', 'hod'), async (req, res) => {
   const { period } = req.query;
   if (!period) return res.status(400).json({ error: 'period is required.' });
   try {
     const result = await pool.query(`
-      SELECT fd.*, u.name as employee_name, p.name as project_name, rv.name as reviewer_name
+      SELECT fd.*, u.name as employee_name, u.department_id as emp_department_id, p.name as project_name, rv.name as reviewer_name
       FROM finance_decisions fd
       JOIN users u ON fd.user_id=u.id
       JOIN projects p ON fd.project_id=p.id
       LEFT JOIN users rv ON fd.reviewed_by=rv.id
       WHERE fd.period=$1 ORDER BY fd.updated_at DESC
     `, [period]);
+    // HODs see decisions for their department's staff only.
+    if (req.user!.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [req.user!.id]
+      );
+      const allowed = new Set(hodDepts.rows.map((r: any) => r.id));
+      result.rows = result.rows.filter((r: any) => allowed.has(r.emp_department_id));
+    }
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch decisions.' });
@@ -162,10 +265,10 @@ router.get('/decisions', authenticate, requireRole('finance', 'admin'), async (r
 });
 
 // GET /finance/decisions/history
-router.get('/decisions/history', authenticate, requireRole('finance', 'admin'), async (req, res) => {
+router.get('/decisions/history', authenticate, requireRole('finance', 'admin', 'hod'), async (req, res) => {
   const { period, decision, user_id } = req.query;
   try {
-    let query = `SELECT fd.*, u.name as employee_name, p.name as project_name, rv.name as reviewer_name
+    let query = `SELECT fd.*, u.name as employee_name, u.department_id as emp_department_id, p.name as project_name, rv.name as reviewer_name
                  FROM finance_decisions fd
                  JOIN users u ON fd.user_id=u.id JOIN projects p ON fd.project_id=p.id
                  LEFT JOIN users rv ON fd.reviewed_by=rv.id WHERE 1=1`;
@@ -176,6 +279,17 @@ router.get('/decisions/history', authenticate, requireRole('finance', 'admin'), 
     if (user_id) { pc++; query += ` AND fd.user_id=$${pc}`; params.push(user_id); }
     query += ' ORDER BY fd.updated_at DESC LIMIT 500';
     const result = await pool.query(query, params);
+    // HODs see history for their department's staff only.
+    if (req.user!.role === 'hod') {
+      const hodDepts = await pool.query(
+        `SELECT id FROM departments WHERE hod_id = $1
+         UNION
+         SELECT department_id FROM users WHERE id = $1 AND department_id IS NOT NULL`,
+        [req.user!.id]
+      );
+      const allowed = new Set(hodDepts.rows.map((r: any) => r.id));
+      result.rows = result.rows.filter((r: any) => allowed.has(r.emp_department_id));
+    }
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch history.' });
@@ -184,11 +298,11 @@ router.get('/decisions/history', authenticate, requireRole('finance', 'admin'), 
 
 // GET /finance/review-queue/export — only ok_for_export rows
 router.get('/review-queue/export', authenticate, requireRole('finance', 'admin'), async (req, res) => {
-  const { period } = req.query;
+  const { period, department_id } = req.query;
   const user = req.user!;
   try {
     let query = `
-      SELECT p.name as project, p.code, u.name as staff,
+      SELECT p.name as project, p.code, u.name as staff, u.role as user_role,
              SUM(dl.hours) as hours,
              COUNT(DISTINCT dl.date) FILTER (WHERE dl.notes IN ('annual_leave','sick_leave')) as leave_days,
              COUNT(DISTINCT dl.date) FILTER (WHERE ph.id IS NOT NULL) as public_holiday_days
@@ -202,7 +316,9 @@ router.get('/review-queue/export', authenticate, requireRole('finance', 'admin')
       WHERE 1=1
     `;
     const params: any[] = [];
-    if (period) { query += ` AND TO_CHAR(dl.date,'YYYY-MM')=$1`; params.push(period); }
+    let pc = 0;
+    if (period) { pc++; query += ` AND TO_CHAR(dl.date,'YYYY-MM')=$${pc}`; params.push(period); }
+    if (department_id) { pc++; query += ` AND p.department_id=$${pc}`; params.push(department_id); }
     query += ` GROUP BY p.name, p.code, u.name HAVING SUM(dl.hours)>0 ORDER BY p.name, u.name`;
     const result = await pool.query(query, params);
     const seqNum = `EXP-${String(period || 'ALL').replace('-','')}-${Date.now()}`;
@@ -211,18 +327,37 @@ router.get('/review-queue/export', authenticate, requireRole('finance', 'admin')
       [seqNum, period || 'all', user.id, result.rows.length]
     );
     if (period) {
+      // Scope the decision flip to the same filter the CSV was built with —
+      // exporting one department must not mark other departments as exported.
       await pool.query(
-        `UPDATE finance_decisions SET decision='exported', exported_at=NOW(), exported_by=$1, export_sequence=$2
-         WHERE period=$3 AND decision='ok_for_export'`,
-        [user.id, seqNum, period]
+        `UPDATE finance_decisions fd SET decision='exported', exported_at=NOW(), exported_by=$1, export_sequence=$2
+         WHERE fd.period=$3 AND fd.decision='ok_for_export'
+           ${department_id ? 'AND fd.project_id IN (SELECT id FROM projects WHERE department_id=$4)' : ''}`,
+        department_id ? [user.id, seqNum, period, department_id] : [user.id, seqNum, period]
       );
     }
     await logAudit(user.id, user.name, 'export_run', 'export_runs', seqNum,
       `Exported ${result.rows.length} rows for period ${period} — sequence ${seqNum}`);
-    const csvRows = result.rows.map((row: any) =>
-      `"${row.project}","${row.code}","${row.staff}",${row.hours},${row.leave_days||0},${row.public_holiday_days||0}`
-    );
-    const csv = ['Project,Code,Staff,Hours,Leave Days,Public Holiday Days', ...csvRows].join('\n');
+
+    // Money columns via effective-dated rates (same grading proxy as review queue)
+    const rateCache = new Map<string, { cost: number; charge: number; currency: string } | null>();
+    let csvRows = [];
+    for (const row of result.rows) {
+      const grade = ['line_manager', 'hod'].includes(String(row.user_role || '')) ? 'MANAGEMENT' : 'STAFF';
+      const key = `${grade}|${row.project}`;
+      if (!rateCache.has(key)) {
+        const r = await pool.query(
+          `SELECT cost_rate, charge_rate, currency FROM fn_rate_for($1, (SELECT id FROM projects WHERE name=$2 LIMIT 1), $3::date)`,
+          [grade, row.project, period ? `${period}-28` : new Date().toISOString().slice(0, 10)]
+        );
+        rateCache.set(key, r.rows.length ? { cost: parseFloat(r.rows[0].cost_rate), charge: parseFloat(r.rows[0].charge_rate), currency: r.rows[0].currency } : null);
+      }
+      const rate = rateCache.get(key);
+      const cost = rate ? Math.round(row.hours * rate.cost * 100) / 100 : '';
+      const charge = rate ? Math.round(row.hours * rate.charge * 100) / 100 : '';
+      csvRows.push(`"${row.project}","${row.code}","${row.staff}",${row.hours},${row.leave_days||0},${row.public_holiday_days||0},${cost},${charge},${rate ? rate.currency : ''}`);
+    }
+    const csv = ['Project,Code,Staff,Hours,Leave Days,Public Holiday Days,Cost Value,Charge Value,Currency', ...csvRows].join('\n');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="approved-time-${period||'all'}-${seqNum}.csv"`);
     res.setHeader('X-Export-Sequence', seqNum);
@@ -269,9 +404,9 @@ router.post('/exports/:sequenceNumber/rerun', authenticate, requireRole('finance
     await logAudit(user.id, user.name, 'export_rerun', 'export_runs', String(sequenceNumber),
       `Re-ran export ${sequenceNumber} for period ${run.period}`);
     const csvRows = result.rows.map((row: any) =>
-      `"${row.project}","${row.code}","${row.staff}",${row.hours},${row.leave_days||0},${row.public_holiday_days||0}`
+      `"${row.project}","${row.code}","${row.staff}",${row.hours},${row.leave_days||0},${row.public_holiday_days||0},,,`
     );
-    const csv = ['Project,Code,Staff,Hours,Leave Days,Public Holiday Days', ...csvRows].join('\n');
+    const csv = ['Project,Code,Staff,Hours,Leave Days,Public Holiday Days,Cost Value,Charge Value,Currency', ...csvRows].join('\n');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="rerun-${sequenceNumber}.csv"`);
     res.send(csv);

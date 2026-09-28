@@ -21,13 +21,17 @@ async function canAccessUser(requestUser: NonNullable<Express.Request['user']>, 
   return false;
 }
 
-async function editableWeekError(userId: string, weekStartDate: string) {
-  const period = await pool.query(
-    'SELECT period_code FROM accounting_periods WHERE $1::date BETWEEN start_date AND end_date AND is_closed = true',
-    [weekStartDate]
-  );
-  if (period.rows.length > 0) {
-    return `Accounting period ${period.rows[0].period_code} is closed. Daily logs are read-only.`;
+async function editableWeekError(userId: string, weekStartDate: string, opts?: { futureLeave?: boolean }) {
+  // Leave planning writes into future periods are allowed even when that
+  // period is closed | it is a forward-looking booking, not attendance data.
+  if (!opts?.futureLeave) {
+    const period = await pool.query(
+      'SELECT period_code FROM accounting_periods WHERE $1::date BETWEEN start_date AND end_date AND is_closed = true',
+      [weekStartDate]
+    );
+    if (period.rows.length > 0) {
+      return `Accounting period ${period.rows[0].period_code} is closed. Daily logs are read-only.`;
+    }
   }
 
   const timesheet = await pool.query(
@@ -213,9 +217,16 @@ router.post('/day', authenticate, async (req, res) => {
     return res.status(400).json({ error: 'entries must be an array.' });
   }
 
+  // Leave planning: future dates may only carry leave (no work hours in advance).
+  const todayStr = new Date().toISOString().split('T')[0];
+  const isFutureLeave = !!leave_type && date > todayStr;
+  if (date > todayStr && !leave_type) {
+    return res.status(400).json({ error: 'Future days can only be planned as leave.' });
+  }
+
   const client = await pool.connect();
   try {
-    const editError = await editableWeekError(user_id, week_start_date);
+    const editError = await editableWeekError(user_id, week_start_date, { futureLeave: isFutureLeave });
     if (editError) return res.status(400).json({ error: editError });
 
     await client.query('BEGIN');

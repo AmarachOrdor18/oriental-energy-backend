@@ -206,7 +206,8 @@ CREATE TABLE IF NOT EXISTS system_settings (
 );
 INSERT INTO system_settings (key, value) VALUES
   ('min_daily_hours', '8'),
-  ('hour_enforcement_mode', 'block')
+  ('hour_enforcement_mode', 'block'),
+  ('go_live_date', '2026-09-21')
 ON CONFLICT (key) DO NOTHING;
 
 -- New columns on timesheets
@@ -253,3 +254,59 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS afe_code VARCHAR;
 
 ALTER TABLE daily_logs ADD COLUMN IF NOT EXISTS activity_id VARCHAR REFERENCES activities(id);
 ALTER TABLE daily_logs ADD COLUMN IF NOT EXISTS activity_name VARCHAR;
+
+-- ============================================================
+-- v7.0 additions — Rate cards, Project budgets (time@work layer)
+-- ============================================================
+
+CREATE SEQUENCE IF NOT EXISTS rate_card_id_seq START 1;
+
+-- rate_cards: effective-dated cost/charge rates per grade × project
+CREATE TABLE IF NOT EXISTS rate_cards (
+  id              VARCHAR PRIMARY KEY DEFAULT pad_id('RC-', nextval('rate_card_id_seq')),
+  grade           VARCHAR NOT NULL,
+  project_id      VARCHAR REFERENCES projects(id),   -- NULL = applies to all projects
+  cost_rate       NUMERIC(12,2) NOT NULL,
+  charge_rate     NUMERIC(12,2) NOT NULL,
+  currency        VARCHAR(3) DEFAULT 'NGN',
+  effective_from  DATE NOT NULL,
+  effective_to    DATE,
+  is_active       BOOLEAN DEFAULT true,
+  created_by      VARCHAR REFERENCES users(id),
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_cards_grade ON rate_cards(grade, effective_from DESC);
+CREATE INDEX IF NOT EXISTS idx_rate_cards_project ON rate_cards(project_id);
+
+-- Budget fields on projects (hours + cost, per year)
+CREATE SEQUENCE IF NOT EXISTS project_budget_id_seq START 1;
+CREATE TABLE IF NOT EXISTS project_budgets (
+  id            VARCHAR PRIMARY KEY DEFAULT pad_id('PB-', nextval('project_budget_id_seq')),
+  project_id    VARCHAR NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  year          INTEGER NOT NULL,
+  budgeted_hours NUMERIC(10,2) NOT NULL DEFAULT 0,
+  budgeted_cost NUMERIC(14,2),
+  created_by    VARCHAR REFERENCES users(id),
+  created_at    TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(project_id, year)
+);
+
+-- Effective-dated rate lookup for approved hours: project-specific rate first,
+-- then the grade-wide card (project_id IS NULL); latest effective_from wins.
+CREATE OR REPLACE FUNCTION fn_rate_for(grade TEXT, project_id TEXT, on_date DATE)
+RETURNS TABLE (cost_rate NUMERIC, charge_rate NUMERIC, currency VARCHAR) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT rc.cost_rate, rc.charge_rate, rc.currency
+  FROM rate_cards rc
+  WHERE rc.grade = fn_rate_for.grade
+    AND rc.is_active = true
+    AND rc.effective_from <= on_date
+    AND (rc.effective_to IS NULL OR rc.effective_to >= on_date)
+    AND (rc.project_id = fn_rate_for.project_id OR rc.project_id IS NULL)
+  ORDER BY (rc.project_id = fn_rate_for.project_id) DESC, rc.effective_from DESC
+  LIMIT 1;
+END;
+$$ LANGUAGE plpgsql;

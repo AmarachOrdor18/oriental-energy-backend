@@ -1,9 +1,8 @@
 import { pool } from '../db';
+import { sendEmail } from './emailService';
 
-export const sendEmail = async (to: string, subject: string, body: string) => {
-  console.log(`[EMAIL] To: ${to} | Subject: ${subject}`);
-  return { success: true };
-};
+// Re-export for compatibility with existing imports.
+export { sendEmail };
 
 const toDateKey = (date: Date) => {
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;

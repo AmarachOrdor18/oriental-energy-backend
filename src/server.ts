@@ -21,14 +21,25 @@ import financeRoutes from './routes/finance';
 import notificationRoutes from './routes/notifications';
 import accountingPeriodRoutes from './routes/accountingPeriods';
 import adminRoutes from './routes/admin';
+import settingsRoutes from './routes/settings';
 import reportsRoutes from './routes/reports';
 import activityRoutes from './routes/activities';
+import utilisationRoutes from './routes/utilisation';
+import rateCardRoutes from './routes/rateCards';
+import budgetRoutes from './routes/budgets';
 import { startNotificationJobs } from './services/notificationService';
+import { sendDueBroadcasts } from './services/broadcastService';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-const LOCAL_ORIGINS = ['http://localhost:5173', 'http://localhost:4173'];
+// Browsers treat localhost and 127.0.0.1 as different origins, and typed URLs or
+// bookmarks often land on the 127.0.0.1 form — allow both for every dev port.
+const LOCAL_ORIGINS = [
+  'http://localhost:5173', 'http://127.0.0.1:5173',
+  'http://localhost:4173', 'http://127.0.0.1:4173',
+  'http://localhost:5200', 'http://127.0.0.1:5200',
+];
 
 // Comma-separated list, set per environment. Localhost is always allowed for dev.
 const allowedOrigins = [
@@ -63,8 +74,12 @@ app.use('/api/v1/finance', financeRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/accounting-periods', accountingPeriodRoutes);
 app.use('/api/v1/admin', adminRoutes);
+app.use('/api/v1/settings', settingsRoutes);
 app.use('/api/v1/reports', reportsRoutes);
 app.use('/api/v1/activities', activityRoutes);
+app.use('/api/v1/utilisation', utilisationRoutes);
+app.use('/api/v1/rate-cards', rateCardRoutes);
+app.use('/api/v1/budgets', budgetRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', version: 'v5.0', timestamp: new Date().toISOString() });
@@ -73,4 +88,6 @@ app.get('/api/health', (_req, res) => {
 app.listen(port, () => {
   console.log(`[Oriental Energy TMS] Server running on port ${port}`);
   startNotificationJobs();
+  // Broadcast scheduler: dispatch due scheduled broadcasts every minute.
+  setInterval(() => { sendDueBroadcasts().catch(() => {}); }, 60_000);
 });

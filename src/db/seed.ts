@@ -185,7 +185,7 @@ async function seed() {
       { name: 'Boxing Day', date: '2026-12-26' },
     ];
     for (const h of holidays) {
-      await client.query('INSERT INTO public_holidays (name, date, year) VALUES ($1, $2, 2026)', [h.name, h.date]);
+      await client.query('INSERT INTO public_holidays (name, date, year) VALUES ($1, $2, $3)', [h.name, h.date, 2026]);
     }
 
     // 6. Sample daily logs and timesheets for recent weeks

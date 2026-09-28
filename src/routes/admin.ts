@@ -42,7 +42,7 @@ router.get('/settings', authenticate, requireRole('admin'), async (req, res) => 
 
 // PATCH /admin/settings
 router.patch('/settings', authenticate, requireRole('admin'), async (req, res) => {
-  const { min_daily_hours, hour_enforcement_mode } = req.body;
+  const { min_daily_hours, hour_enforcement_mode, go_live_date } = req.body;
   const user = req.user!;
   try {
     if (min_daily_hours !== undefined) {
@@ -62,6 +62,17 @@ router.patch('/settings', authenticate, requireRole('admin'), async (req, res) =
       await pool.query(
         `UPDATE system_settings SET value=$1, updated_by=$2, updated_at=NOW() WHERE key='hour_enforcement_mode'`,
         [hour_enforcement_mode, user.id]
+      );
+    }
+    if (go_live_date !== undefined) {
+      const d = new Date(go_live_date);
+      if (isNaN(d.getTime())) {
+        return res.status(400).json({ error: 'go_live_date must be a valid date (YYYY-MM-DD).' });
+      }
+      await pool.query(
+        `INSERT INTO system_settings (key, value, updated_by, updated_at) VALUES ('go_live_date', $1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $1, updated_by = $2, updated_at = NOW()`,
+        [d.toISOString().slice(0, 10), user.id]
       );
     }
     await logAudit(user.id, user.name, 'settings_updated', 'system_settings', null,
